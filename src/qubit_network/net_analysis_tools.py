@@ -1,23 +1,23 @@
-import os
+import collections
+import fnmatch
 import glob
 import logging
-import fnmatch
-import pprint
+import os
 import pickle
-import collections
-
-import numpy as np
-import pandas as pd
-import sympy
+import pprint
 
 import matplotlib.pyplot as plt
-import seaborn as sns
-import cufflinks
-
+import numpy as np
+import pandas as pd
 import qutip
+import sympy
 
+import cufflinks
+import progressbar
+import seaborn as sns
+
+from .model import QubitNetworkGateModel, QubitNetworkModel
 from .QubitNetwork import QubitNetwork
-from .model import QubitNetworkModel, QubitNetworkGateModel
 from .utils import chop, getext, normalize_phase
 
 
@@ -301,6 +301,70 @@ def fidelity_vs_J(net):
         outputs=fidelities
     )
 
+# ----------------------------------------------------------------
+# Computation of average fidelity between gates and maps
+# ----------------------------------------------------------------
+
+
+def big_unitary_to_map(U, dim_system, ancilla_state=0):
+    """Compute (open) action of the unitary U on reduced system.
+
+    From a (generally unitary) matrix `U`, compute the open map representing
+    the action of `U` on a subset of the modes. More precisely, we consider the
+    space as tensor product of a "system" and an "ancilla", and compute the map
+    corresponding to the reduced action of `U` on the system, when the ancilla
+    is in a specific (pure) initial state `ancilla_state`.
+    The resulting map is given as a four-dimensional numpy tensor.
+    """
+    if isinstance(U, qutip.Qobj):
+        U = U.full()
+    else:
+        U = np.asarray(U)
+    total_dim = U.shape[0]
+    other_dim = total_dim // dim_system
+    # sanity check: `dim_system` must divide the dimension of `U`
+    if dim_system * other_dim != total_dim:
+        raise ValueError('This decomposition makes no sense.')
+    # reshape unitary to take into account tensor structure of space
+    gate_as_tensor = U.reshape((dim_system, other_dim) * 2)
+    # consider only action on specific initial ancilla state
+    gate_as_tensor = gate_as_tensor[:, :, :, ancilla_state]
+    # compute the actual corresponding map tensor
+    map_as_tensor = np.einsum('kmi,lmj->klij',
+                              gate_as_tensor,
+                              gate_as_tensor.conj())
+    return map_as_tensor
+
+
+def exact_average_fidelity_mapVSunitary(map_, unitary):
+    """Compute average fidelity between a map and a unitary.
+
+    The fidelity is computed exactly using (a variation of) the formulae given
+    in https://arxiv.org/abs/quant-ph/0205035.
+
+    The map is expected to be given as a four-dimensional numpy tensor.
+    The unitary is expected to be given as a two-dimensional numpy tensor.
+    """
+    if isinstance(unitary, qutip.Qobj):
+        unitary = unitary.full()
+    D = unitary.shape[0]
+    expval = np.einsum('ki,lj,klij', unitary.conj(), unitary, map_).real
+    return 1 / (D + 1) * (1 + expval / D)
+
+
+def exact_average_fidelity_unitaryVSunitary(U, V):
+    """Compute average fidelity between two unitary matrices.
+
+    Both `U` and `V` should be numpy or qutip matrix.
+    """
+    if isinstance(U, qutip.Qobj):
+        U = U.full()
+    if isinstance(V, qutip.Qobj):
+        V = V.full()
+    D = U.shape[0]
+    expval = np.einsum('ij,ij,kl,kl', U.conj(), V, U, V.conj()).real
+    return 1 / (D + 1) * (1 + expval / D)
+
 
 # ----------------------------------------------------------------
 # Loading nets from file
@@ -359,11 +423,11 @@ def _load_network_from_pickle(filename):
     pickle format, using the appropriate `save_to_file` method.
     The returned object is QubitNetworkGateModel.
     """
-    logging.info('Trying to load net from pickled file "{}"'.format(filename))
+    logging.debug('Trying to load net from pickled file "{}"'.format(filename))
     with open(filename, 'rb') as file:
         data = pickle.load(file)
     if 'J' in data:
-        logging.info('Old format detected. Trying to load using old rules')
+        logging.debug('Old format detected. Trying to load using old rules')
         return _load_network_from_pickle_old(data)
     # otherwise we can just use `sympy_model`:
     net_data = data['net_data']
@@ -381,12 +445,12 @@ def _load_network_from_pickle(filename):
     # expensive. Instead, alternative equivalent representations are used.
     # If not a sympy.Matrix object, the model should be a tuple.
     if isinstance(net_data['sympy_model'], sympy.Matrix):
-        logging.info('Model saved using sympy.Matrix object')
+        logging.debug('Model saved using sympy.Matrix object')
         num_qubits = int(np.log2(net_data['sympy_model'].shape[0]))
     # else, we assume the content of 'sympy_model' is a tuple with structure
     # (parameters, matrices)
     else:
-        logging.info('Model saved using efficient sympy style')
+        logging.debug('Model saved using efficient sympy style')
         num_qubits = int(np.log2(net_data['sympy_model'][1][0].shape[0]))
 
     model = QubitNetworkGateModel(
@@ -497,6 +561,13 @@ class NetDataFile:
     def opt_data(self):
         if self._data is None:
             self._load()
+        # give warning if _opt_data is None, which probably means this is an
+        # old style net, for which no optimization data has been saved.
+        if self._opt_data is None:
+            import warnings
+            warnings.warn('You tried to access `_opt_data`, but its value has '
+                          'not been set. This can mean that for this net no '
+                          'optimization data was saved.')
         return self._opt_data
 
     def _get_interactions_old_style(self):
@@ -550,11 +621,22 @@ class NetsDataFolder:
     nets : list of NetDataFile objects
     """
 
-    def __init__(self, path_or_files='../data/nets/'):
+    def __init__(self, path_or_files):
+        self.files = []
+        self.nets = []
+        self.paths = []
         if isinstance(path_or_files, str):
-            self._load_from_dir(path_or_files)
+            self._load_nets_from_list([path_or_files])
         elif isinstance(path_or_files, (list, tuple)):
-            self._load_from_file_list(path_or_files)
+            self._load_nets_from_list(path_or_files)
+
+    def _add_net_from_file(self, file_):
+        # check that `file` is an actual file
+        if not os.path.isfile(file_):
+            raise ValueError('"{}" is not a valid path.'.format(file))
+        logging.info('Loading net from "{}".'.format(file_))
+        self.files.append(file_)
+        self.nets.append(NetDataFile(file_))
 
     def _load_from_dir(self, path):
         # ensure tha path is of the form 'whatever/'
@@ -563,23 +645,17 @@ class NetsDataFolder:
         # raise error if path is not a directory
         if not os.path.isdir(path):
             raise ValueError('path must be a valid directory.')
-        self.path = path
-        # load pickle files in path
-        self.files = glob.glob(path + '*.pickle')
-        # raise error if no json and pickle files are found
-        if len(self.files) == 0:
-            raise FileNotFoundError('No valid data files found in '
-                                    '{}.'.format(path))
-        # for each data file associate a `NetDataFile` object, and store
-        # the collection of such objects in `self.nets`.
-        self.nets = []
-        for file_ in self.files:
-            self.nets.append(NetDataFile(file_))
+        self.paths.append(path)
+        # for each data file associate a `NetDataFile` object
+        for file_ in glob.glob(path + '*.pickle'):
+            self._add_net_from_file(file_)
 
-    def _load_from_file_list(self, files_list):
-        self.path = None
-        self.files = list(files_list)
-        self.nets = [NetDataFile(file_) for file_ in files_list]
+    def _load_nets_from_list(self, paths_list):
+        for path in paths_list:
+            if os.path.isfile(path):
+                self._add_net_from_file(path)
+            else:
+                self._load_from_dir(path)
 
     def __repr__(self):
         return self._repr_dataframe().__repr__()
@@ -588,16 +664,18 @@ class NetsDataFolder:
         return self._repr_dataframe()._repr_html_()
 
     def _repr_dataframe(self, sort=True):
-        names = [net.name for net in self.nets]
-        target_gates = [net.get_target_gate() for net in self.nets]
+        # names = [net.name for net in self.nets]
+        # target_gates = [net.get_target_gate() for net in self.nets]
         # load sorted data in pandas DataFrame
+        pd.set_option('display.max_colwidth', -1)
         df = pd.DataFrame({
-            'target gates': target_gates,
-            'names': names
-        })[['target gates', 'names']]
+            'paths': self.files
+            # 'target gates': target_gates,
+            # 'names': names
+        })
         # return formatted string
         if sort:
-            return df.sort_values(by=['names']).reset_index(drop=True)
+            return df.sort_values(by=['paths'])
         else:
             return df
 
@@ -643,15 +721,12 @@ class NetsDataFolder:
         The returned object is a new `NetsDataFolder` instance.
         Simple wildcard matching is provided by `fnmatch.filter`.
         """
-        new_data = NetsDataFolder(self.path)
-        new_data.files = fnmatch.filter(self.files, '*/' + pat)
-        new_data.nets = [net for net in self.nets
-                         if fnmatch.fnmatch(net.name, pat)]
+        logging.info('Filtering using pattern: "{}".'.format(pat))
+        filtered_files = fnmatch.filter(self.files, '*/' + pat)
+        new_data = NetsDataFolder(filtered_files)
+        if len(new_data.files) == 0:
+            print('No matching files.')
         return new_data
-        # names = fnmatch.filter([net.name for net in self.nets], pat)
-        # for net in self.nets:
-        #     if net.name in names:
-        #         yield net
 
     def get_filenames(self):
         return [os.path.splitext(name)[0] for name in self.files]
@@ -660,27 +735,50 @@ class NetsDataFolder:
         self = NetsDataFolder(self.path)
         return self
 
-    def view_fidelities(self, n_samples=40, additional_fields=None):
+    def view_fidelities(self, n_samples=40, num_iterations=True,
+                        num_system_qubits=True, num_ancillae=True,
+                        exact_fidelity=True):
         """Display nets in folder, each with an estimate of the fidelity.
 
-        The `additional_fields` parameter can be used to print more information
-        than just the fidelity. It must be a list of strings. The accepted
-        strings are: 'num_iterations'.
+        Parameters
+        ----------
+        exact_fidelity : bool
+            If True, the fidelity is computed using the exact formula for the
+            average fidelity. Otherwise, the fidelity is estimated with a
+            finite sample size of random states.
         """
         data = self._repr_dataframe(sort=False)
-        fids = [net.fidelity_test(n_samples=n_samples)
-                for net in self.nets]
+        logging.info('Computing fidelities:')
+        # compute fidelities
+        fids = []
+        bar = progressbar.ProgressBar()
+        for net in bar(self.nets):
+            if exact_fidelity:
+                fids.append(net.average_fidelity())
+            else:
+                fids.append(net.fidelity_test(n_samples=n_samples))
         # add other information on top of fidelities, if requested
         other_fields = []
-        if additional_fields is not None:
-            if not isinstance(additional_fields, (list, tuple)):
-                additional_fields = [additional_fields]
-            for field_name in additional_fields:
-                if field_name == 'num_iterations':
-                    iterations = [net.opt_data['log']['fidelities'].shape[0]
-                                  for net in self.nets]
-                    iterations = pd.Series(iterations, name='num iterations')
-                    other_fields.append(iterations)
+        if num_iterations:
+            iterations = []
+            for net in self.nets:
+                if net._opt_data is not None:
+                    iterations.append(
+                        net.opt_data['log']['fidelities'].shape[0])
+                else:
+                    iterations.append(0)
+            iterations = pd.Series(iterations, name='num iterations')
+            other_fields.append(iterations)
+        if num_system_qubits:
+            other_fields.append(pd.Series(
+                [net.num_system_qubits for net in self.nets],
+                name='num system qubits'
+            ))
+        if num_ancillae:
+            other_fields.append(pd.Series(
+                [net.num_qubits - net.num_system_qubits for net in self.nets],
+                name='num ancillae'
+            ))
         # produce final dataframe to return
         data = pd.concat((
             data,
@@ -689,14 +787,18 @@ class NetsDataFolder:
         ), axis=1)
         return data
 
-    def view_parameters(self, n_samples=40):
-        """
-        Return a dataframe showing the parameters for every net.
+    def view_parameters(self, exact_average_fidelity=True, n_samples=100):
+        """Return a dataframe showing the parameters for every net.
+
+        `n_samples` is only used if `exact_average_fidelity` is `False`.
         """
         data = None
         for net in self.nets:
             # compute fidelity for net
-            fid = net.fidelity_test(n_samples=n_samples)
+            if exact_average_fidelity:
+                fid = net.average_fidelity()
+            else:
+                fid = net.fidelity_test(n_samples=n_samples)
             # get data for net
             new_df = net.interactions.rename(columns={'value': fid})
             if data is None:
@@ -706,7 +808,7 @@ class NetsDataFolder:
         return data
 
     def plot_parameters(self, connectgaps=True, hlines=[], return_fig=False,
-                        marker_size=6):
+                        marker_size=6, use_sqrt_fidelity=False):
         """
         Plot an overlay scatter plot of all the nets using plotly.
         """
@@ -714,6 +816,8 @@ class NetsDataFolder:
         # retrieve data to plot
         data = self.view_parameters()
         fids = data.columns
+        if use_sqrt_fidelity:
+            fids = np.sqrt(fids)
         data_cols = data.values.T
         # make trace object
         traces = []

@@ -1,15 +1,15 @@
-import os
 import logging
-import pandas as pd
-import numpy as np
-import sympy
-import qutip
+import os
 
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import qutip
+import sympy
 import theano
 import theano.tensor as T
 import theano.tensor.slinalg
 
-import matplotlib.pyplot as plt
 import seaborn as sns
 
 from .model import QubitNetworkGateModel
@@ -87,27 +87,48 @@ class Optimizer:
     Parameters
     ----------
     net : object or string
-        Object representing the qubit network to be trained. If a string
-        is given the object is loaded from fileusing `Optimizer._load_net`.
+        Object representing the qubit network to be trained. If a string,
+        the object is loaded from file using `Optimizer._load_net`.
     learning_rate : float
-        Initial learning rate for the training. The value of the learning
-        rate will usually (depending on the training method) be adapted
-        during training.
+        Initial learning rate for the training.
+        If momentum SGD is used, its value is slowly decreased during the
+        training. If naive SGD is used, its initial value is used for the whole
+        training phase. If adadelta SGD is used, the initial value is not used.
     decay_rate : float
         Determines the rate at which the learning rate decreases for
-        each epoch.
-    training_dataset_size
-    test_dataset_size
-    batch_size
-    n_epochs
-    target_gate
-    sgd_method
+        each epoch (used with momentum SGD).
+    training_dataset_size : integer
+        The number of training states generated for each epoch.
+        At the beginning of each new epoch, a new dataset is generated.
+    test_dataset_size : integer
+        The number of test states used to assess the fidelity at the end of
+        every epoch. This set is generated at the beginning of the training
+        phase, and never changed.
+    batch_size : integer
+        This is the number of iterations that each epoch is divided into.
+        The training states (specified in `training_dataset_size`) are divided
+        into chunks of size `batch_size`.
+    n_epochs : integer
+        Number of epochs after which the training is stopped regardless of the
+        final fidelity. If unit fidelity is achieved, the training stops before
+        this number is reached.
+    target_gate : qutip.Qobj object
+        This value is simply passed to the associated QubitNetworkGateModel
+        instance, in case it wasn't already specified there.
+    sgd_method : string
+        The training method to be used. Accepted values are 'momentum' and
+        'adadelta'. Any other value is assumed to represent naive SGD (with
+        non-adaptive learning rate).
+    headless : bool
+        If True, no fidelity plot is drawn (note that the values of the
+        fidelities for each epoch are still logged).
 
     Attributes
     ----------
-    net : some subclass of QubitNetworkModel
-    hyperpars : dict
-        Contains all the hyperparameters of the model.
+    net : subclass of QubitNetworkModel (often QubitNetworkGateModel)
+    learning_rate : number, optional
+        The initial learning rate. Depending on the training algorithm used,
+        the learning rate may be adadpted during training.
     vars : dict of theano objects
         Contains the theano objects used in the fidelity graph.
     cost
@@ -127,7 +148,8 @@ class Optimizer:
                  n_epochs=None,
                  target_gate=None,
                  sgd_method='momentum',
-                 headless=False):
+                 headless=False,
+                 figax=None):
         # use headless to suppress printed messages (like you may want
         # to when running the code in a script)
         self._in_terminal = headless
@@ -143,6 +165,14 @@ class Optimizer:
             initial_learning_rate=learning_rate,
             decay_rate=decay_rate
         )
+        logging.info('Training SGD method: {}.'.format(sgd_method))
+        if sgd_method == 'momentum':
+            logging.info('Initial learning rate: {}.'.format(learning_rate))
+            logging.info('Decay rate: {}.'.format(decay_rate))
+        logging.info('Training dataset size: {}.'.format(training_dataset_size))
+        logging.info('Test dataset size: {}.'.format(test_dataset_size))
+        logging.info('Maximum number of epochs: {}.'.format(n_epochs))
+        logging.info('Batch size: {}.'.format(batch_size))
         # self.vars stores the shared variables for the computation
         def _sharedfloat(arr, name):
             return theano.shared(np.asarray(
@@ -176,8 +206,11 @@ class Optimizer:
         # initialize log to be filled with the history later
         self.log = {'fidelities': None, 'parameters': None}
         # create figure object
-        self._fig = None
-        self._ax = None
+        if figax is None:
+            self._fig = None
+            self._ax = None
+        else:
+            self._fig, self._ax = figax
 
     @classmethod
     def load(cls, file):
@@ -191,16 +224,17 @@ class Optimizer:
         # accept only pickle files as of now
         if ext != '.pickle':
             raise NotImplementedError('Only pickle files for now!')
+        logging.info('Loading optimizer from file: `{}`.'.format(file))
         with open(file, 'rb') as f:
             data = pickle.load(f)
         net_data = data['net_data']
         opt_data = data['optimization_data']
         # create QubitNetwork instance
         if isinstance(net_data['sympy_model'], sympy.Matrix):
-            logging.info('Model saved using sympy.Matrix object')
+            logging.debug('Model saved using sympy.Matrix object')
             num_qubits = np.log2(net_data['sympy_model'].shape[0]).astype(int)
         else:
-            logging.info('Model saved using efficient sympy style')
+            logging.debug('Model saved using efficient sympy style')
             num_qubits = int(np.log2(net_data['sympy_model'][1][0].shape[0]))
 
         if net_data['ancillae_state'] is None:
@@ -239,6 +273,18 @@ class Optimizer:
         if isinstance(net, str):
             raise NotImplementedError('To be reimplemented')
         return net
+
+    def __repr__(self):
+        msg = 'Optimizer object. Properties:'
+        msg += '    SGD method: {}'.format(self.hyperpars['sgd_method'])
+        msg += '    Learning rate: {}'.format(
+            self.hyperpars['initial_learning_rate'])
+        msg += '    Decay rate: {}'.format(self.hyperpars['decay_rate'])
+        msg += '    Training dataset size: {}'.format(
+            self.hyperpars['train_dataset_size'])
+        msg += '    Test dataset size: {}'.format(
+            self.hyperpars['test_dataset_size'])
+        return msg
 
     def _get_meaningful_history(self):
         fids = self.log['fidelities']
@@ -416,8 +462,9 @@ class Optimizer:
         logging.info('Model compilation - Finished')
 
     def _run(self, save_parameters=True, len_shown_history=200):
-        logging.info('And... here we go!')
+        logging.info('Starting training phase.')
         # generate testing states
+        logging.info('Generating batch of testing states.')
         self.refill_test_data()
         # now let's prepare the theano graph
         self._compile_model()
@@ -480,9 +527,12 @@ class Optimizer:
     def plot_parameters_history(self, return_fig=False, return_df=False):
         import cufflinks
         names = [par.name for par in self.net.free_parameters]
+        # retrieve parameters history
         df = pd.DataFrame(self._get_meaningful_history()['parameters'])
+        # retrieve initial values and prepend them to history
         initial_values = pd.DataFrame([self.initial_parameters_values])
         df = pd.concat([initial_values, df], ignore_index=True)
+        # set columns name
         new_col_names = dict(zip(range(df.shape[1]), names))
         df.rename(columns=new_col_names, inplace=True)
         if return_df:

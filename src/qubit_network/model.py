@@ -1,24 +1,24 @@
-import os
-import numbers
 import logging
+import numbers
+import os
 import time
 
-import sympy
-import scipy
-import pandas as pd
+import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import qutip
-
+import scipy
+import sympy
 import theano
 import theano.tensor as T
 import theano.tensor.slinalg
 
-import matplotlib.pyplot as plt
 import seaborn as sns
 
-from .utils import complex2bigreal
 from .QubitNetwork import QubitNetwork
 from .theano_qutils import TheanoQstates
+from .utils import complex2bigreal
+from . import net_analysis_tools as nat
 
 
 def _random_input_states(num_states, num_qubits):
@@ -101,18 +101,21 @@ class QubitNetworkModel(QubitNetwork):
                  free_parameters_order=None,
                  initial_values=None):
         # Initialize `QubitNetwork` parent
-        logging.info('Initializing QubitNetworkModel..')
+        logging.debug('Initializing QubitNetworkModel.')
         super().__init__(num_qubits=num_qubits,
                          interactions=interactions,
                          net_topology=net_topology,
                          sympy_expr=sympy_expr,
                          free_parameters_order=free_parameters_order)
         # attributes initialization
-        logging.info('Setting initial values to {}'.format(initial_values))
+        if initial_values is not None:
+            logging.debug('Setting initial values to {}'.format(initial_values))
+        else:
+            logging.debug('Setting random initial parameters values.')
         self.initial_values = self._set_initial_values(initial_values)
         # The graph is computed starting from the content of `self.matrices`
         # and  `self.initial_values`
-        logging.info('Building Hamiltonian computational graph')
+        logging.debug('Building Hamiltonian computational graph')
         self.parameters, self.hamiltonian_model = self._build_theano_graph()
         # self.inputs and self.outputs are the holders for the training/testing
         # inputs and corresponding output states. They are used to build
@@ -456,11 +459,24 @@ class QubitNetworkGateModel(QubitNetworkModel):
             # compute fidelity
             # fidelity = (psi_in.dag() * target_gate.dag() *
             #             dm_out * target_gate * psi_in)
-            fidelities[idx] = qutip.fidelity(target_gate * psi_in, dm_out)
+            fidelities[idx] = qutip.fidelity(target_gate * psi_in, dm_out)**2
         if return_mean:
             return fidelities.mean()
         else:
             return fidelities
+
+    def average_fidelity(self):
+        """Compute average fidelity using exact formula."""
+        if self.num_qubits > self.num_system_qubits:
+            dim_system = 2**self.num_system_qubits
+            map_as_tensor = nat.big_unitary_to_map(self.get_current_gate(),
+                                                   dim_system)
+            return nat.exact_average_fidelity_mapVSunitary(map_as_tensor,
+                                                           self.target_gate)
+        else:
+            return nat.exact_average_fidelity_unitaryVSunitary(
+                self.get_current_gate(), self.target_gate
+            )
 
     def fidelity(self, return_mean=True):
         """Return theano graph for fidelity given training states.
@@ -516,15 +532,7 @@ class QubitNetworkGateModel(QubitNetworkModel):
         if self.target_gate is None:
             raise TargetGateNotGivenError('Target gate not set yet.')
 
-        # 1) Generate random input states over system qubits
-        # `rand_ket_haar` seems to be slightly faster than `rand_ket`
-        # length_inputs = 2 ** self.num_system_qubits
-        # qutip_dims = [[2 for _ in range(self.num_system_qubits)],
-        #               [1 for _ in range(self.num_system_qubits)]]
-        # training_inputs = [
-        #     qutip.rand_ket_haar(length_inputs, dims=qutip_dims)
-        #     for _ in range(num_states)
-        # ]
+        # 1) Generate random input states OVER SYSTEM QUBITS
         training_inputs = _random_input_states(num_states,
                                                self.num_system_qubits)
         # 2) Compute corresponding output states
