@@ -33,8 +33,7 @@ PLACEHOLDER_FILE_FULLDIR = os.path.join(OUTPUT_DIR, PLACEHOLDER_FILE)
 def setup_logging():
     logger = logging.getLogger()
     logger.setLevel(logging.DEBUG)
-    FORMAT = "[%(asctime)s %(filename)18s:%(lineno)3s - "
-    FORMAT += "%(funcName)25s()] %(message)s"
+    FORMAT = "[%(asctime)s %(filename)18s:%(lineno)3s - %(funcName)25s()] %(message)s"
     formatter = logging.Formatter(FORMAT, datefmt='%Y-%m-%d %H:%M:%S')
 
     consoleHandler = logging.StreamHandler()
@@ -51,38 +50,45 @@ def setup_logging():
     logger.addHandler(fileHandler)
 
 
-def make_fredkin_model():
+def make_XY_model(num_qubits):
     import qubit_network.analytical_conditions as ac
 
     def X(i, num_qubits=3):
         zeros = [0] * num_qubits
-        zeros[i - 1] = 1
+        zeros[i] = 1
         return ac.pauli_product(*zeros)
     def Y(i, num_qubits=3):
         zeros = [0] * num_qubits
-        zeros[i - 1] = 2
+        zeros[i] = 2
         return ac.pauli_product(*zeros)
     def Z(i, num_qubits=3):
         zeros = [0] * num_qubits
-        zeros[i - 1] = 3
+        zeros[i] = 3
         return ac.pauli_product(*zeros)
-    def XY(i, j, num_qubits=3):
-        first_term = X(i, num_qubits) * X(j, num_qubits)
-        second_term = Y(i, num_qubits) * Y(j, num_qubits)
-        return first_term + second_term
+    def XX(i, j, num_qubits=3):
+        return X(i, num_qubits) * X(j, num_qubits)
 
-    num_qubits = 4
+    def YY(i, j, num_qubits=3):
+        return Y(i, num_qubits) * Y(j, num_qubits)
+
     expr = sympy.zeros(2**num_qubits, 2**num_qubits)
     # all single-qubit interactions
     for idx in range(num_qubits):
         for pauli_idx in range(3):
             mol = [0] * num_qubits
-            mol[pauli_idx] = 1
+            mol[idx] = pauli_idx + 1
             expr += ac.pauli_product(*mol) * ac.J(*mol)
-    # only XY two-qubit interactions
+    # only XX and YY two-qubit interactions
     for pair in itertools.combinations(range(num_qubits), 2):
-        expr += (ac.J(pair[0], pair[1]) *
-				 XY(pair[0], pair[1], num_qubits=num_qubits))
+        molXX = [0] * num_qubits
+        molXX[pair[0]] = 1
+        molXX[pair[1]] = 1
+        expr += ac.J(*molXX) * XX(pair[0], pair[1], num_qubits)
+
+        molYY = [0] * num_qubits
+        molYY[pair[0]] = 2
+        molYY[pair[1]] = 2
+        expr += ac.J(*molYY) * YY(pair[0], pair[1], num_qubits)
     # return final expression
     return expr
 
@@ -97,8 +103,7 @@ def main():
     # SET TARGET GATE AND INTERACTIONS
     target_gate = qutip.fredkin()
     # interactions = 'all'
-    fredkin_model = make_fredkin_model()
-    print(fredkin_model.shape)
+    fredkin_model = make_XY_model(num_qubits)
     # HYPERPARAMETERS
     training_dataset_size = 200
     test_dataset_size = 100
@@ -107,7 +112,7 @@ def main():
     sgd_method = 'adadelta'
     learning_rate = 1
     decay_rate = 0.1
-    initial_values = None
+    initial_values = 'random'
     logging.info('Random initial values')
     # TAKE CARE NOT TO OVERWRITE PREVIOUSLY SAVED FILES
     prefix = os.path.join(OUTPUT_DIR, OUTPUT_FILES_NAME)
@@ -122,8 +127,8 @@ def main():
 
         model = qn.model.QubitNetworkGateModel(
             sympy_expr=fredkin_model,
-            num_system_qubits=3,
-            initial_values=initial_values
+            initial_values=initial_values,
+            num_system_qubits=num_system_qubits
         )
         optimizer = qn.Optimizer.Optimizer(
             net=model,
@@ -146,7 +151,7 @@ def main():
         )
 
         optimizer.save_results(newpath)
-        logging.info('Fidelity obtained: {}'.format(model.fidelity_test()))
+        logging.info('Fidelity obtained: {}'.format(model.average_fidelity()))
 
 
 if __name__ == '__main__':
@@ -162,3 +167,4 @@ if __name__ == '__main__':
     main()
     logging.info('Training finished. Deleting placeholder file.')
     os.remove(PLACEHOLDER_FILE_FULLDIR)
+
